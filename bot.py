@@ -2,6 +2,7 @@ import ssl
 import aiohttp
 import json
 import os
+import asyncio
 
 from datetime import datetime, timedelta
 
@@ -45,7 +46,6 @@ PANELS = {
         "username": os.getenv("PANEL1_USER"),
         "password": os.getenv("PANEL1_PASS")
     },
-
     "panel2": {
         "url": os.getenv("PANEL2_URL"),
         "username": os.getenv("PANEL2_USER"),
@@ -63,36 +63,24 @@ DEVIR_FILE = "devir.json"
 ALERTS_FILE = "alerts.json"
 
 # =========================================================
-# JSON LOAD
+# JSON
 # =========================================================
 
 def load_json(file_name, default=None):
-
     if default is None:
         default = {}
 
     try:
-
         with open(file_name, "r", encoding="utf-8") as f:
             return json.load(f)
-
     except:
         return default
 
+
 def save_json(file_name, data):
-
     with open(file_name, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-# =========================================================
-# LOAD DATA
-# =========================================================
 
 USERS = load_json(USERS_FILE)
 LIMITS = load_json(LIMITS_FILE)
@@ -102,15 +90,13 @@ LIMITS = load_json(LIMITS_FILE)
 # =========================================================
 
 def tr(x):
-
     try:
         return f"{int(float(x)):,}".replace(",", ".")
-
     except:
         return "0"
 
 # =========================================================
-# PANELDEN KASA ÇEK
+# PANEL FETCH
 # =========================================================
 
 async def fetch_user_amount(panel_config, user_uuid):
@@ -126,24 +112,15 @@ async def fetch_user_amount(panel_config, user_uuid):
         connector=aiohttp.TCPConnector(ssl=ssl_ctx)
     ) as session:
 
-        # LOGIN SAYFASI
         async with session.get(login_url) as r:
             text = await r.text()
 
         token = ""
-
         for line in text.splitlines():
-
             if 'name="_token"' in line:
-
-                token = (
-                    line.split('value="')[1]
-                    .split('"')[0]
-                )
-
+                token = line.split('value="')[1].split('"')[0]
                 break
 
-        # LOGIN
         await session.post(
             login_url,
             data={
@@ -153,28 +130,17 @@ async def fetch_user_amount(panel_config, user_uuid):
             }
         )
 
-        # REPORT SAYFASI
         async with session.get(reports_url) as r:
             text = await r.text()
 
         csrf = ""
-
         for line in text.splitlines():
-
             if 'csrf-token' in line:
-
-                csrf = (
-                    line.split('content="')[1]
-                    .split('"')[0]
-                )
-
+                csrf = line.split('content="')[1].split('"')[0]
                 break
 
-        today = (
-            datetime.utcnow() + timedelta(hours=3)
-        ).strftime("%Y-%m-%d")
+        today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
 
-        # RAPOR İSTEĞİ
         async with session.post(
             reports_url,
             headers={
@@ -188,31 +154,17 @@ async def fetch_user_amount(panel_config, user_uuid):
                 "bank": "",
                 "user": user_uuid
             }
-
         ) as r:
-
             data = await r.json()
 
-        deposit_total = float(
-            data.get("deposit", [0])[0] or 0
-        )
+        deposit_total = float(data.get("deposit", [0])[0] or 0)
+        withdraw_total = float(data.get("withdraw", [0])[0] or 0)
+        delivery_total = float(data.get("delivery", [0, 0])[1] or 0)
 
-        withdraw_total = float(
-            data.get("withdraw", [0])[0] or 0
-        )
-
-        delivery_total = float(
-            data.get("delivery", [0, 0])[1] or 0
-        )
-
-        return (
-            deposit_total,
-            withdraw_total,
-            delivery_total
-        )
+        return deposit_total, withdraw_total, delivery_total
 
 # =========================================================
-# KASA HESAPLA
+# KASA HESAP
 # =========================================================
 
 async def calculate_kasa(username):
@@ -222,107 +174,27 @@ async def calculate_kasa(username):
     panel = info["panel"]
     uuid = info["uuid"]
 
-    deposit_total, withdraw_total, delivery_total = await fetch_user_amount(
+    deposit, withdraw, delivery = await fetch_user_amount(
         PANELS[panel],
         uuid
     )
 
-    commission = deposit_total * 0.025
+    commission = deposit * 0.025
 
-    net = (
-        deposit_total
-        - withdraw_total
-        - delivery_total
-        - commission
-    )
+    net = deposit - withdraw - delivery - commission
 
     devirs = load_json(DEVIR_FILE)
-
-    devir = float(
-        devirs.get(username, 0)
-    )
+    devir = float(devirs.get(username, 0))
 
     total = net + devir
 
-    return {
-        "deposit": deposit_total,
-        "withdraw": withdraw_total,
-        "delivery": delivery_total,
-        "commission": commission,
-        "net": net,
-        "devir": devir,
-        "total": total
-    }
+    return total
 
 # =========================================================
-# /KASA1
-# /KASA2
+# AUTO LIMIT CHECK (3 DAKİKA)
 # =========================================================
 
-async def kasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    msg = await update.message.reply_text(
-        "Kasa verileri alınıyor..."
-    )
-
-    try:
-
-        user_id = update.effective_user.id
-
-        if user_id not in ADMIN_IDS:
-
-            await msg.edit_text(
-                "Bu komutu sadece adminler kullanabilir."
-            )
-
-            return
-
-        command = (
-            update.message.text
-            .lstrip("/")
-            .upper()
-        )
-
-        username = command.replace(
-            "KASA",
-            "SKY"
-        )
-
-        if username not in USERS:
-
-            await msg.edit_text(
-                "Kullanıcı bulunamadı."
-            )
-
-            return
-
-        data = await calculate_kasa(username)
-
-        await msg.edit_text(
-
-            f"🏦 {username} KASA\n\n"
-
-            f"💸 Yatırım: {tr(data['deposit'])} TL\n"
-            f"💰 Çekim: {tr(data['withdraw'])} TL\n"
-            f"🚚 Teslimat: {tr(data['delivery'])} TL\n"
-            f"📉 Komisyon: {tr(data['commission'])} TL\n"
-            f"📊 Net: {tr(data['net'])} TL\n"
-            f"🔁 Devir: {tr(data['devir'])} TL\n\n"
-
-            f"🏦 TOPLAM: {tr(data['total'])} TL"
-        )
-
-    except Exception as e:
-
-        await msg.edit_text(
-            f"Hata oluştu:\n{e}"
-        )
-
-# =========================================================
-# OTOMATİK LIMIT KONTROL
-# =========================================================
-
-async def auto_kasa_check(context: ContextTypes.DEFAULT_TYPE):
+async def auto_kasa_check(app):
 
     try:
 
@@ -335,140 +207,56 @@ async def auto_kasa_check(context: ContextTypes.DEFAULT_TYPE):
 
             limit = float(LIMITS[username])
 
-            data = await calculate_kasa(username)
+            total = await calculate_kasa(username)
 
-            total = data["total"]
+            already = alerts.get(username, False)
 
-            already_alerted = alerts.get(
-                username,
-                False
-            )
+            if total >= limit and not already:
 
-            # LIMIT GEÇİLDİ
-            if total >= limit and not already_alerted:
-
-                await context.bot.send_message(
+                await app.bot.send_message(
                     chat_id=ALERT_CHAT_ID,
                     text=(
-
                         f"🚨 KASA LİMİT UYARISI 🚨\n\n"
-
                         f"Hesap: {username}\n"
                         f"Limit: {tr(limit)} TL\n"
-                        f"Güncel Kasa: {tr(total)} TL\n\n"
-
-                        f"Tarih: "
-                        f"{datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                        f"Güncel Kasa: {tr(total)} TL\n"
+                        f"Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
                     )
                 )
 
                 alerts[username] = True
-
                 save_json(ALERTS_FILE, alerts)
 
-            # LIMIT ALTINA DÜŞERSE RESET
             elif total < limit:
-
                 alerts[username] = False
-
                 save_json(ALERTS_FILE, alerts)
 
     except Exception as e:
-
-        print(f"OTO KASA HATA: {e}")
-
-# =========================================================
-# FORWARD SİSTEMİ
-# =========================================================
-
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    message = update.message
-
-    if not message:
-        return
-
-    text = message.text or message.caption or ""
-
-    # ETİKET YOKSA ÇALIŞMA
-    if BOT_USERNAME not in text.lower():
-        return
-
-    grup_adi = (
-        message.chat.title
-        or "Bilinmeyen Grup"
-    )
-
-    gonderen = (
-        message.from_user.first_name
-        or "Anonim"
-    )
-
-    ust_bilgi = (
-
-        f"📢 Kaynak Grup: {grup_adi}\n"
-        f"👤 Gönderen: {gonderen}\n\n"
-    )
-
-    for hedef in HEDEF_GRUPLAR:
-
-        try:
-
-            # TEXT
-            if message.text:
-
-                await context.bot.send_message(
-                    chat_id=hedef,
-                    text=ust_bilgi + message.text
-                )
-
-            # FOTO / VIDEO / DOSYA
-            else:
-
-                await context.bot.copy_message(
-                    chat_id=hedef,
-                    from_chat_id=message.chat_id,
-                    message_id=message.message_id,
-                    caption=ust_bilgi + (
-                        message.caption or ""
-                    )
-                )
-
-        except Exception as e:
-
-            print(f"FORWARD HATA: {e}")
+        print("AUTO KASA HATA:", e)
 
 # =========================================================
-# APP
+# BACKGROUND LOOP (3 DK)
+# =========================================================
+
+async def kasa_loop(app):
+
+    while True:
+
+        await auto_kasa_check(app)
+
+        await asyncio.sleep(180)  # 3 dakika
+
+async def post_init(app):
+    asyncio.create_task(kasa_loop(app))
+
+# =========================================================
+# BOT START
 # =========================================================
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN bulunamadı")
+    raise RuntimeError("BOT_TOKEN yok")
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-# /kasa1 /kasa2
-app.add_handler(
-    MessageHandler(
-        filters.Regex(r"^/kasa\d+$"),
-        kasa
-    )
-)
-
-# forward sistemi
-app.add_handler(
-    MessageHandler(
-        filters.ALL,
-        handle
-    )
-)
-
-# HER 5 DAKİKADA KONTROL
-app.job_queue.run_repeating(
-    auto_kasa_check,
-    interval=300,
-    first=10
-)
+app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
 print("BOT AKTİF")
 

@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters
@@ -21,7 +20,8 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lower()
 
-ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID"))
+_raw_alert = os.getenv("ALERT_CHAT_ID", "").strip()
+ALERT_CHAT_ID = int(_raw_alert) if _raw_alert else None
 
 HEDEF_GRUPLAR = [
     int(x)
@@ -34,6 +34,19 @@ ADMIN_IDS = [
     for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip()
 ]
+
+def _parse_int(env_name: str):
+
+    raw = os.getenv(env_name, "").strip()
+
+    if not raw:
+        return None
+
+    return int(raw)
+
+
+LIMIT_CHECK_INTERVAL_SEC = _parse_int("LIMIT_CHECK_INTERVAL_SEC") or 300
+LIMIT_CHECK_FIRST_SEC = _parse_int("LIMIT_CHECK_FIRST_SEC") or 10
 
 # =========================================================
 # PANEL CONFIG
@@ -94,8 +107,8 @@ def save_json(file_name, data):
 # LOAD DATA
 # =========================================================
 
-USERS = load_json(USERS_FILE)
-LIMITS = load_json(LIMITS_FILE)
+# NOT: USERS / LIMITS her işlemde disktan okunur; limits.json
+# güncellendiğinde botu yeniden başlatmaya gerek kalmaz.
 
 # =========================================================
 # FORMAT
@@ -217,13 +230,23 @@ async def fetch_user_amount(panel_config, user_uuid):
 
 async def calculate_kasa(username):
 
-    info = USERS[username]
+    users_data = load_json(USERS_FILE)
+
+    info = users_data[username]
 
     panel = info["panel"]
     uuid = info["uuid"]
 
+    panel_conf = PANELS.get(panel) or {}
+
+    if not panel_conf.get("url"):
+        raise RuntimeError(
+            f"Panel '{panel}' için PANEL*_URL eksik "
+            f"veya .env yanlış (hesap {username})."
+        )
+
     deposit_total, withdraw_total, delivery_total = await fetch_user_amount(
-        PANELS[panel],
+        panel_conf,
         uuid
     )
 
@@ -288,7 +311,9 @@ async def kasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SKY"
         )
 
-        if username not in USERS:
+        users_data = load_json(USERS_FILE)
+
+        if username not in users_data:
 
             await msg.edit_text(
                 "Kullanıcı bulunamadı."
@@ -328,46 +353,64 @@ async def auto_kasa_check(context: ContextTypes.DEFAULT_TYPE):
 
         alerts = load_json(ALERTS_FILE)
 
-        for username in USERS.keys():
 
-            if username not in LIMITS:
+        users_data = load_json(USERS_FILE)
+        limits_data = load_json(LIMITS_FILE)
+
+        for username in limits_data.keys():
+
+            if username not in users_data:
+                print(
+                    f"OTO KASA: {username} limits.json içinde ama "
+                    f"users.json'da yok, atlanıyor."
+                )
                 continue
 
-            limit = float(LIMITS[username])
+            limit = float(limits_data[username])
 
-            data = await calculate_kasa(username)
+            try:
+                data = await calculate_kasa(username)
+            except Exception as e:
+                print(f"OTO KASA {username}: kasa hesap hatası: {e}")
+                continue
 
             total = data["total"]
 
-            already_alerted = alerts.get(
-                username,
-                False
+            already_alerted = bool(
+                alerts.get(username, False)
             )
 
             # LIMIT GEÇİLDİ
             if total >= limit and not already_alerted:
 
-                await context.bot.send_message(
-                    chat_id=ALERT_CHAT_ID,
-                    text=(
+                try:
+                    await context.bot.send_message(
+                        chat_id=ALERT_CHAT_ID,
+                        text=(
 
-                        f"🚨 KASA LİMİT UYARISI 🚨\n\n"
+                            f"🚨 KASA LİMİT UYARISI 🚨\n\n"
 
-                        f"Hesap: {username}\n"
-                        f"Limit: {tr(limit)} TL\n"
-                        f"Güncel Kasa: {tr(total)} TL\n\n"
+                            f"Hesap: {username}\n"
+                            f"Limit: {tr(limit)} TL\n"
+                            f"Güncel Kasa: {tr(total)} TL\n\n"
 
-                        f"Tarih: "
-                        f"{datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                            f"Tarih: "
+                            f"{datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                        )
                     )
-                )
+                except Exception as e:
+                    print(
+                        f"OTO KASA {username}: Telegram mesaj gönderilemedi "
+                        f"(chat_id doğru mu, bot yazabiliyor mu?): {e}"
+                    )
+                    continue
 
                 alerts[username] = True
 
                 save_json(ALERTS_FILE, alerts)
 
-            # LIMIT ALTINA DÜŞERSE RESET
-            elif total < limit:
+            # LIMIT ALTINA DÜŞERSE RESET (sadece state değişince kaydet)
+            elif total < limit and already_alerted:
 
                 alerts[username] = False
 
@@ -445,7 +488,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN bulunamadı")
 
+if ALERT_CHAT_ID is None:
+    raise RuntimeError(
+        "ALERT_CHAT_ID bulunamadı veya boş — limit uyarılarının "
+        "gideceği sohbet/kanal ID\'sini .env içinde tam sayı olarak ver."
+    )
+
 app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+if app.job_queue is None:
+    raise RuntimeError(
+        "JobQueue yok. Kurulum: pip install 'python-telegram-bot[job-queue]'"
+    )
 
 # /kasa1 /kasa2
 app.add_handler(
@@ -463,11 +517,11 @@ app.add_handler(
     )
 )
 
-# HER 5 DAKİKADA KONTROL
+# Varsayılan 5 dk; LIMIT_CHECK_INTERVAL_SEC ile değiştirilebilir
 app.job_queue.run_repeating(
     auto_kasa_check,
-    interval=300,
-    first=10
+    interval=LIMIT_CHECK_INTERVAL_SEC,
+    first=LIMIT_CHECK_FIRST_SEC
 )
 
 print("BOT AKTİF")

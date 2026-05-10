@@ -3,37 +3,27 @@ import aiohttp
 import json
 import os
 import asyncio
-
 from datetime import datetime, timedelta
 
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 # =========================================================
-# ENV
+# ENV SAFE LOAD
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lower()
 
-ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID"))
+ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", "0"))
 
 HEDEF_GRUPLAR = [
-    int(x)
-    for x in os.getenv("TARGET_GROUPS", "").split(",")
-    if x.strip()
+    int(x) for x in os.getenv("TARGET_GROUPS", "").split(",") if x.strip()
 ]
 
 ADMIN_IDS = [
-    int(x)
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip()
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
 ]
 
 # =========================================================
@@ -54,36 +44,28 @@ PANELS = {
 }
 
 # =========================================================
-# DOSYALAR
+# SAFE JSON
 # =========================================================
 
-USERS_FILE = "users.json"
-LIMITS_FILE = "limits.json"
-DEVIR_FILE = "devir.json"
-ALERTS_FILE = "alerts.json"
-
-# =========================================================
-# JSON
-# =========================================================
-
-def load_json(file_name, default=None):
+def load_json(path, default=None):
     if default is None:
         default = {}
-
     try:
-        with open(file_name, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
         return default
 
 
-def save_json(file_name, data):
-    with open(file_name, "w", encoding="utf-8") as f:
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-USERS = load_json(USERS_FILE)
-LIMITS = load_json(LIMITS_FILE)
+USERS = load_json("users.json", {})
+LIMITS = load_json("limits.json", {})
+DEVIR = load_json("devir.json", {})
+ALERTS = load_json("alerts.json", {})
 
 # =========================================================
 # FORMAT
@@ -157,19 +139,21 @@ async def fetch_user_amount(panel_config, user_uuid):
         ) as r:
             data = await r.json()
 
-        deposit_total = float(data.get("deposit", [0])[0] or 0)
-        withdraw_total = float(data.get("withdraw", [0])[0] or 0)
-        delivery_total = float(data.get("delivery", [0, 0])[1] or 0)
+        deposit = float(data.get("deposit", [0])[0] or 0)
+        withdraw = float(data.get("withdraw", [0])[0] or 0)
+        delivery = float(data.get("delivery", [0, 0])[1] or 0)
 
-        return deposit_total, withdraw_total, delivery_total
+        return deposit, withdraw, delivery
 
 # =========================================================
-# KASA HESAP
+# CALCULATE
 # =========================================================
 
 async def calculate_kasa(username):
 
-    info = USERS[username]
+    info = USERS.get(username)
+    if not info:
+        return 0
 
     panel = info["panel"]
     uuid = info["uuid"]
@@ -180,25 +164,20 @@ async def calculate_kasa(username):
     )
 
     commission = deposit * 0.025
-
     net = deposit - withdraw - delivery - commission
 
-    devirs = load_json(DEVIR_FILE)
-    devir = float(devirs.get(username, 0))
+    devir = float(DEVIR.get(username, 0))
 
-    total = net + devir
-
-    return total
+    return net + devir
 
 # =========================================================
-# AUTO LIMIT CHECK (3 DAKİKA)
+# AUTO CHECK LOOP (3 MIN)
 # =========================================================
 
 async def auto_kasa_check(app):
 
     try:
-
-        alerts = load_json(ALERTS_FILE)
+        alerts = load_json("alerts.json", {})
 
         for username in USERS.keys():
 
@@ -209,9 +188,7 @@ async def auto_kasa_check(app):
 
             total = await calculate_kasa(username)
 
-            already = alerts.get(username, False)
-
-            if total >= limit and not already:
+            if total >= limit and not alerts.get(username):
 
                 await app.bot.send_message(
                     chat_id=ALERT_CHAT_ID,
@@ -219,44 +196,67 @@ async def auto_kasa_check(app):
                         f"🚨 KASA LİMİT UYARISI 🚨\n\n"
                         f"Hesap: {username}\n"
                         f"Limit: {tr(limit)} TL\n"
-                        f"Güncel Kasa: {tr(total)} TL\n"
+                        f"Güncel: {tr(total)} TL\n"
                         f"Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
                     )
                 )
 
                 alerts[username] = True
-                save_json(ALERTS_FILE, alerts)
+                save_json("alerts.json", alerts)
 
             elif total < limit:
                 alerts[username] = False
-                save_json(ALERTS_FILE, alerts)
+                save_json("alerts.json", alerts)
 
     except Exception as e:
-        print("AUTO KASA HATA:", e)
+        print("AUTO ERROR:", e)
 
 # =========================================================
-# BACKGROUND LOOP (3 DK)
+# BACKGROUND LOOP SAFE
 # =========================================================
 
 async def kasa_loop(app):
-
     while True:
-
         await auto_kasa_check(app)
-
         await asyncio.sleep(180)  # 3 dakika
 
 async def post_init(app):
     asyncio.create_task(kasa_loop(app))
 
 # =========================================================
-# BOT START
+# FORWARD HANDLER (BASIC SAFE)
+# =========================================================
+
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    msg = update.message
+    if not msg:
+        return
+
+    text = msg.text or msg.caption or ""
+
+    if BOT_USERNAME and BOT_USERNAME not in text.lower():
+        return
+
+    for target in HEDEF_GRUPLAR:
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text=text
+            )
+        except:
+            pass
+
+# =========================================================
+# START BOT
 # =========================================================
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN yok")
+    raise RuntimeError("BOT_TOKEN YOK")
 
 app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+app.add_handler(MessageHandler(filters.ALL, handle))
 
 print("BOT AKTİF")
 
